@@ -245,7 +245,7 @@ rt_app = workflow.compile()
 # 6. LANGSERVE INPUT / OUTPUT ADAPTER
 # ============================================================
 
-class AgentInput(TypedDict):
+class AgentInput(BaseModel):
     input: str
 
 
@@ -293,7 +293,7 @@ formatted_agent_chain = (
     RunnableLambda(format_for_agent)
     | rt_app
     | RunnableLambda(extract_agent_response)
-)
+).with_types(input_type=AgentInput)
 
 
 # ============================================================
