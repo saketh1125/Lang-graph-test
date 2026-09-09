@@ -1,16 +1,18 @@
+````python
 import os
 import sys
 import io
 import traceback
 from typing import TypedDict, List, Optional
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableLambda
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langserve import add_routes
 
 
 # ============================================================
@@ -27,8 +29,10 @@ if not GEMINI_API_KEY:
     )
 
 
-# Gemini model
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
+MODEL_NAME = os.getenv(
+    "GEMINI_MODEL",
+    "gemma-4-31b-it"
+)
 
 llm = ChatGoogleGenerativeAI(
     model=MODEL_NAME,
@@ -37,34 +41,7 @@ llm = ChatGoogleGenerativeAI(
 
 
 # ============================================================
-# 2. FASTAPI APPLICATION
-# ============================================================
-
-app = FastAPI(
-    title="AI Coding Crew",
-    description="LangGraph + Gemini coding task pipeline",
-    version="1.0.0",
-)
-
-
-# ============================================================
-# 3. REQUEST / RESPONSE MODELS
-# ============================================================
-
-class TaskRequest(BaseModel):
-    task: str
-
-
-class TaskResponse(BaseModel):
-    task: str
-    generated_code: str
-    execution_output: str
-    test_scenarios: str
-    report: str
-
-
-# ============================================================
-# 4. LANGGRAPH STATE
+# 2. LANGGRAPH STATE
 # ============================================================
 
 class CrewState(TypedDict):
@@ -75,7 +52,7 @@ class CrewState(TypedDict):
 
 
 # ============================================================
-# 5. TOOLS
+# 3. TOOLS
 # ============================================================
 
 @tool
@@ -151,7 +128,9 @@ def generate_test_cases(task_description: str) -> str:
 
         for item in content:
             if isinstance(item, dict):
-                parts.append(str(item.get("text", "")))
+                parts.append(
+                    str(item.get("text", ""))
+                )
             else:
                 parts.append(str(item))
 
@@ -161,7 +140,7 @@ def generate_test_cases(task_description: str) -> str:
 
 
 # ============================================================
-# 6. GRAPH NODES
+# 4. GRAPH NODES
 # ============================================================
 
 def developer_node(state: CrewState):
@@ -187,7 +166,9 @@ def developer_node(state: CrewState):
 
         for item in content:
             if isinstance(item, dict):
-                parts.append(str(item.get("text", "")))
+                parts.append(
+                    str(item.get("text", ""))
+                )
             else:
                 parts.append(str(item))
 
@@ -228,7 +209,7 @@ def tester_node(state: CrewState):
 
 
 # ============================================================
-# 7. LANGGRAPH CONSTRUCTION
+# 5. LANGGRAPH CONSTRUCTION
 # ============================================================
 
 workflow = StateGraph(CrewState)
@@ -262,6 +243,87 @@ rt_app = workflow.compile()
 
 
 # ============================================================
+# 6. LANGSERVE INPUT / OUTPUT ADAPTER
+# ============================================================
+
+class AgentInput(TypedDict):
+    input: str
+
+
+def format_for_agent(x) -> dict:
+    """
+    Convert LangServe Playground input into
+    the LangGraph state expected by the workflow.
+    """
+
+    user_input = (
+        x["input"]
+        if isinstance(x, dict)
+        else x.input
+    )
+
+    return {
+        "messages": [
+            HumanMessage(content=user_input)
+        ],
+        "next_step": None,
+        "code": None,
+        "report": None,
+    }
+
+
+def extract_agent_response(result: dict) -> dict:
+    """
+    Return a clean response containing the generated
+    code and final report.
+    """
+
+    return {
+        "generated_code": result.get(
+            "code",
+            ""
+        ),
+        "report": result.get(
+            "report",
+            "No report generated."
+        )
+    }
+
+
+formatted_agent_chain = (
+    RunnableLambda(format_for_agent)
+    | rt_app
+    | RunnableLambda(extract_agent_response)
+)
+
+
+# ============================================================
+# 7. FASTAPI + LANGSERVE
+# ============================================================
+
+app = FastAPI(
+    title="AI Coding Crew",
+    description="LangGraph + Gemini coding task pipeline",
+    version="1.0.0",
+)
+
+
+# This creates:
+#
+# /agent/invoke
+# /agent/batch
+# /agent/stream
+# /agent/playground/
+#
+add_routes(
+    app,
+    formatted_agent_chain,
+    path="/agent",
+    playground_type="default",
+)
+
+
+# ============================================================
 # 8. HEALTH CHECK
 # ============================================================
 
@@ -282,64 +344,7 @@ def health():
 
 
 # ============================================================
-# 9. MAIN API ENDPOINT
-# ============================================================
-
-@app.post("/run", response_model=TaskResponse)
-def run_task(request: TaskRequest):
-
-    task = request.task.strip()
-
-    if not task:
-        raise HTTPException(
-            status_code=400,
-            detail="Task cannot be empty."
-        )
-
-    try:
-
-        initial_state: CrewState = {
-            "messages": [
-                HumanMessage(content=task)
-            ],
-            "next_step": None,
-            "code": None,
-            "report": None,
-        }
-
-        result = rt_app.invoke(
-            initial_state,
-            config={
-                "recursion_limit": 20
-            }
-        )
-
-        return TaskResponse(
-            task=task,
-            generated_code=result.get(
-                "code",
-                ""
-            ),
-            execution_output=(
-                result.get("report", "")
-            ),
-            test_scenarios="",
-            report=result.get(
-                "report",
-                "No report generated."
-            ),
-        )
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-# ============================================================
-# 10. LOCAL DEVELOPMENT
+# 9. LOCAL / RENDER STARTUP
 # ============================================================
 
 if __name__ == "__main__":
@@ -351,7 +356,8 @@ if __name__ == "__main__":
     )
 
     uvicorn.run(
-        "app:app",
+        app,
         host="0.0.0.0",
         port=port,
     )
+````
