@@ -5,6 +5,7 @@ import traceback
 from typing import TypedDict, List, Optional
 
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
