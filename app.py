@@ -1,400 +1,359 @@
-
+````python
+import os
 import sys
-
 import io
-
 import traceback
-
 from typing import TypedDict, List, Optional
 
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
 from langchain_core.messages import BaseMessage, HumanMessage
-
 from langchain_core.tools import tool
-
 from langgraph.graph import StateGraph, START, END
-
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
-# ==========================================
+# Render provides this through Environment Variables.
+# Do NOT hardcode the API key.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 1. LLM INITIALIZATION
-
-# ==========================================
-
-# Initialize your LLM here (e.g., ChatOpenAI, ChatGoogleGenerativeAI, etc.)
-
-
-
-import google.generativeai as genai
-
-from google.colab import userdata
+if not GEMINI_API_KEY:
+    raise RuntimeError(
+        "GEMINI_API_KEY environment variable is not set."
+    )
 
 
+# Gemini model
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
 
-# Retrieve the API key from secrets
-
-try:
-
-  api_key = userdata.get('GEMINI_API_KEY')
-
-  genai.configure(api_key=api_key)
-
-  print("API Key configured successfully.")
-
-except userdata.SecretNotFoundError:
-
-  print("Error: GEMINI_API_KEY not found in secrets")
+llm = ChatGoogleGenerativeAI(
+    model=MODEL_NAME,
+    google_api_key=GEMINI_API_KEY,
+)
 
 
+# ============================================================
+# 2. FASTAPI APPLICATION
+# ============================================================
 
-llm_flash = ChatGoogleGenerativeAI(model="gemma-4-31b-it", google_api_key = api_key)
+app = FastAPI(
+    title="AI Coding Crew",
+    description="LangGraph + Gemini coding task pipeline",
+    version="1.0.0",
+)
 
-llm= llm_flash
+
+# ============================================================
+# 3. REQUEST / RESPONSE MODELS
+# ============================================================
+
+class TaskRequest(BaseModel):
+    task: str
 
 
+class TaskResponse(BaseModel):
+    task: str
+    generated_code: str
+    execution_output: str
+    test_scenarios: str
+    report: str
 
-# ==========================================
 
-# 2. STATE DEFINITION
-
-# ==========================================
+# ============================================================
+# 4. LANGGRAPH STATE
+# ============================================================
 
 class CrewState(TypedDict):
-
-  messages: List[BaseMessage]
-
-  next_step: Optional[str]
-
-  code: Optional[str]
-
-  report: Optional[str]
+    messages: List[BaseMessage]
+    next_step: Optional[str]
+    code: Optional[str]
+    report: Optional[str]
 
 
-
-# ==========================================
-
-# 3. TOOLS
-
-# ==========================================
+# ============================================================
+# 5. TOOLS
+# ============================================================
 
 @tool
-
 def run_python_code(code: str) -> str:
+    """
+    Execute generated Python code and return stdout or
+    an error traceback.
+    """
 
-  """Execute python code and return the standard output or error trace."""
+    if not isinstance(code, str):
+        code = str(code)
 
-  if not isinstance(code, str):
+    clean_code = (
+        code
+        .replace("```python", "")
+        .replace("```", "")
+        .strip()
+    )
 
-    code = str(code)
+    old_stdout = sys.stdout
+    new_stdout = io.StringIO()
 
-  clean_code = code.replace('```python', '').replace('```', '').strip()
+    sys.stdout = new_stdout
 
+    try:
+        local_scope = {}
 
+        exec(
+            clean_code,
+            {},
+            local_scope
+        )
 
-  old_stdout = sys.stdout
+        result = new_stdout.getvalue()
 
-  new_stdout = io.StringIO()
+    except Exception:
+        result = (
+            "Execution Error:\n"
+            + traceback.format_exc()
+        )
 
-  sys.stdout = new_stdout
+    finally:
+        sys.stdout = old_stdout
 
-
-
-  try:
-
-    local_scope = {}
-
-    exec(clean_code, {}, local_scope)
-
-    result = new_stdout.getvalue()
-
-  except Exception as e:
-
-    result = f"Execution Error:\n{traceback.format_exc()}"
-
-  finally:
-
-    sys.stdout = old_stdout
-
-
-
-  return result.strip() if result.strip() else "Success (no terminal output)"
-
-
-
+    return (
+        result.strip()
+        if result.strip()
+        else "Success (no terminal output)"
+    )
 
 
 @tool
-
 def generate_test_cases(task_description: str) -> str:
+    """
+    Generate specific test scenarios for a coding task.
+    """
 
-   """Generate specific test scenarios for a given coding task."""
+    prompt = (
+        "You are a Senior QA Engineer.\n\n"
+        "Generate 3 to 5 highly specific test scenarios "
+        "for the following coding task:\n\n"
+        f"{task_description}\n\n"
+        "Include both standard cases and edge cases.\n"
+        "Return them as a numbered list."
+    )
 
-   prompt = (
+    response = llm.invoke(prompt)
 
-     f"You are a Senior QA Engineer. Generate 3 to 5 highly specific test scenarios "
+    content = response.content
 
-     f"for the following coding task: '{task_description}'.\n"
+    if isinstance(content, list):
+        parts = []
 
-     f"Include standard cases and edge cases. Return them as a numbered list."
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
 
-   )
+        return "\n".join(parts)
 
-   response = llm.invoke(prompt)
+    return str(content)
 
-   return response.content if hasattr(response, 'content') else str(response)
 
+# ============================================================
+# 6. GRAPH NODES
+# ============================================================
 
+def developer_node(state: CrewState):
 
-# Initialize the test tool with the LLM
+    task = state["messages"][-1].content
 
-# (Uncomment this once your LLM is initialized above)
+    dev_prompt = (
+        "Write a clean Python script to solve this coding task:\n\n"
+        f"{task}\n\n"
+        "Requirements:\n"
+        "- Return ONLY executable Python code.\n"
+        "- Do not include markdown.\n"
+        "- Do not include ```python.\n"
+        "- Do not include explanations."
+    )
 
-# generate_test_cases = create_test_generator_tool(llm_flash)
+    response = llm.invoke(dev_prompt)
 
+    content = response.content
 
+    if isinstance(content, list):
+        parts = []
 
-# ==========================================
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
 
-# 4. GRAPH NODES
+        code_str = "\n".join(parts)
 
-# ==========================================
+    else:
+        code_str = str(content)
 
-def task_input_node(state: CrewState):
+    return {
+        "code": code_str.strip()
+    }
 
-  print("\n" + "="*50)
 
-  print("--- NEW TASK INITIALIZATION ---")
+def tester_node(state: CrewState):
 
-  user_task = input("Enter the coding task (or type 'exit' to quit): ").strip()
+    task = state["messages"][-1].content
 
+    # Generate test scenarios
+    test_cases = generate_test_cases.invoke(task)
 
+    # Execute generated code
+    execution_result = run_python_code.invoke(
+        {
+            "code": state["code"]
+        }
+    )
 
-  if user_task.lower() == 'exit':
+    report = (
+        "### EXECUTION OUTPUT\n\n"
+        f"{execution_result}\n\n"
+        "### TEST SCENARIOS EVALUATED\n\n"
+        f"{test_cases}"
+    )
 
-     return {"next_step": "exit"}
+    return {
+        "report": report
+    }
 
-
-
-  return {
-
-    "messages": [HumanMessage(content=user_task)],
-
-    "next_step": "developer"
-
-  }
-
-
-
-def real_time_developer(state: CrewState):
-
-  print("\n[Developer] Writing dynamic code using LLM...")
-
-  # Get the latest task description
-
-  task = state['messages'][-1].content
-
-  dev_prompt = f"Write a clean Python script to solve this: {task}. Only return the code, no explanation or markdown formatting."
-
-
-
-  # Ensure LLM is initialized before calling
-
-  if llm_flash is None:
-
-    raise ValueError("LLM is not initialized. Please set up 'llm_flash'.")
-
-
-
-  response = llm_flash.invoke(dev_prompt)
-
-  # --- FIX: Safely parse Gemini's content format ---
-
-  content = response.content
-
-  if isinstance(content, list):
-
-    # Extract the text from the first dictionary in the list
-
-    code_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
-
-  else:
-
-    # It's already a standard string
-
-    code_str = str(content)
-
-  print(code_str)
-
-  return {"code": code_str}
-
-
-
-def real_time_tester(state: CrewState):
-
-  print("\n[Tester] Generating dynamic tests and executing code...")
-
-  task = state['messages'][-1].content
-
-
-
-  # Generate tests
-
-  test_cases = generate_test_cases.invoke(task)
-
-  content = test_cases
-
-  if isinstance(content, list):
-
-    # Extract the text from the first dictionary in the list
-
-    cases_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
-
-  else:
-
-    # It's already a standard string
-
-    cases_str = str(content)
-
-  # Execute code
-
-  execution_result = run_python_code.invoke({"code": state['code']})
-
-
-
-  # Compile Report
-
-  report = f"### EXECUTION OUTPUT:\n{execution_result}\n\n### TEST SCENARIOS EVALUATED:\n{cases_str}"
-
-  return {"report": report}
-
-
-
-def manager_decision_node(state: CrewState):
-
-  print("\n" + "="*50)
-
-  print("--- MANAGER DASHBOARD : TEST REPORT ---")
-
-  print(state.get('report', 'No report available.'))
-
-  print("="*50)
-
-
-
-  user_input = input("\nCommand (store / another): ").lower().strip()
-
-
-
-  if user_input == 'store':
-
-    return {"next_step": "archiver"}
-
-  else:
-
-    return {"next_step": "task_input"}
-
-
-
-def archiver_node(state: CrewState):
-
-  print("\n[Archiver] Task stored successfully. Closing workflow.")
-
-  return {"next_step": "exit"}
-
-
-
-# ==========================================
-
-# 5. GRAPH CONSTRUCTION & ROUTING
-
-# ==========================================
-
-rt_workflow = StateGraph(CrewState)
-
-
-
-rt_workflow.add_node("task_input", task_input_node)
-
-rt_workflow.add_node("developer", real_time_developer)
-
-rt_workflow.add_node("tester", real_time_tester)
-
-rt_workflow.add_node("manager_decision", manager_decision_node)
-
-rt_workflow.add_node("archiver", archiver_node)
-
-
-
-rt_workflow.add_edge(START, "task_input")
-
-
-
-def route_from_input(state):
-
-  if state.get('next_step') == "exit":
-
-    return END
-
-  return "developer"
-
-
-
-rt_workflow.add_conditional_edges("task_input", route_from_input)
-
-
-
-# Sequential flow
-
-rt_workflow.add_edge("developer", "tester")
-
-rt_workflow.add_edge("tester", "manager_decision")
-
-
-
-def route_from_decision(state):
-
-  if state.get('next_step') == "archiver":
-
-    return "archiver"
-
-  return "task_input"
-
-
-
-rt_workflow.add_conditional_edges("manager_decision", route_from_decision)
-
-rt_workflow.add_edge("archiver", END)
-
-
-
-rt_app = rt_workflow.compile()
-
-print("Interactive pipeline compiled and ready for live execution.")
-
-
-
-# ==========================================
-
-# 6. EXECUTION LOOP
-
-# ==========================================
+
+# ============================================================
+# 7. LANGGRAPH CONSTRUCTION
+# ============================================================
+
+workflow = StateGraph(CrewState)
+
+workflow.add_node(
+    "developer",
+    developer_node
+)
+
+workflow.add_node(
+    "tester",
+    tester_node
+)
+
+workflow.add_edge(
+    START,
+    "developer"
+)
+
+workflow.add_edge(
+    "developer",
+    "tester"
+)
+
+workflow.add_edge(
+    "tester",
+    END
+)
+
+rt_app = workflow.compile()
+
+
+# ============================================================
+# 8. HEALTH CHECK
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "status": "online",
+        "service": "AI Coding Crew",
+        "model": MODEL_NAME,
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
+
+
+# ============================================================
+# 9. MAIN API ENDPOINT
+# ============================================================
+
+@app.post("/run", response_model=TaskResponse)
+def run_task(request: TaskRequest):
+
+    task = request.task.strip()
+
+    if not task:
+        raise HTTPException(
+            status_code=400,
+            detail="Task cannot be empty."
+        )
+
+    try:
+
+        initial_state: CrewState = {
+            "messages": [
+                HumanMessage(content=task)
+            ],
+            "next_step": None,
+            "code": None,
+            "report": None,
+        }
+
+        result = rt_app.invoke(
+            initial_state,
+            config={
+                "recursion_limit": 20
+            }
+        )
+
+        return TaskResponse(
+            task=task,
+            generated_code=result.get(
+                "code",
+                ""
+            ),
+            execution_output=(
+                result.get("report", "")
+            ),
+            test_scenarios="",
+            report=result.get(
+                "report",
+                "No report generated."
+            ),
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# ============================================================
+# 10. LOCAL DEVELOPMENT
+# ============================================================
 
 if __name__ == "__main__":
 
-  try:
+    import uvicorn
 
-    # Start the application with an empty state
+    port = int(
+        os.getenv("PORT", "8000")
+    )
 
-    # The recursion limit is set high to allow for multiple loops (another task)
-
-    rt_app.invoke({"messages": []}, config={"recursion_limit": 50})
-
-  except KeyboardInterrupt:
-
-    print("\nStopped by user.")
-
-  except Exception as e:
-
-    print(f"\nAn error occurred: {e}")
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=port,
+    )
+````
